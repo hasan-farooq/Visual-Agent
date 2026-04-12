@@ -103,6 +103,8 @@ class SteelBlueTheme(Soft):
 
 steel_blue_theme = SteelBlueTheme()
 
+LESION_EXAMPLE_PATH = os.path.join(os.path.dirname(__file__), "lesion.jpeg")
+DEFAULT_LESION_PROMPT = "if the skin is damaged, detect the lesions"
 
 css = r"""
 @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
@@ -1229,6 +1231,17 @@ with gr.Blocks() as demo:
                 placeholder="e.g., left lung opacity, liver lesion, hemorrhagic region, tumor boundary",
                 lines=2,
             )
+
+            if os.path.exists(LESION_EXAMPLE_PATH):
+                gr.Examples(
+                    examples=[[LESION_EXAMPLE_PATH, DEFAULT_LESION_PROMPT]],
+                    inputs=[image_input, prompt_input],
+                    label="Example",
+                )
+            else:
+                gr.Markdown(
+                    f"**Example ready:** add `lesion.jpeg` next to `app.py` to enable the built-in sample with prompt: `{DEFAULT_LESION_PROMPT}`."
+                )
 
             with gr.Accordion("Reliability Settings", open=False):
                 conf_slider = gr.Slider(
