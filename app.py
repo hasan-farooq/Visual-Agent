@@ -1,8 +1,8 @@
 """
-Agentic CT Assistant (Educational) — Lazy Model Loading
-========================================================
+Agentic CT Assistant (Educational) — Hierarchical Tree Reasoning
+================================================================
 
-Model loading strategy (the core fix):
+Model loading strategy (unchanged):
 ────────────────────────────────────────
   App starts
       │
@@ -16,12 +16,23 @@ Model loading strategy (the core fix):
       │       TS exits memory
       │       → load_qwen() called for the first time
       │
-  User clicks "Run Agentic Analysis"
+  User clicks "Analyse"
               load_qwen() is a no-op (already loaded)
               Qwen reads df.parquet from disk
               TS is never involved again
 
-Result: Qwen and TotalSegmentator NEVER share VRAM under any code path.
+Reasoning change (new):
+────────────────────────
+  Single hierarchical_reasoning_step() replaces the old
+  planner → reflection → answer chain.
+  The model is prompted to build an explicit anatomy/ontology
+  tree BEFORE synthesising an educational answer.
+
+  Tree structure:
+    DECOMPOSE  → what anatomy is involved? (Uberon-style hierarchy)
+    GROUND     → what does the segmentation show?
+    REFLECT    → is the tree complete? any gaps?
+    SYNTHESIZE → educational answer leaf nodes
 """
 
 import os
@@ -119,22 +130,16 @@ LABEL_MENU = "\n".join(f"{lid}: {name}" for lid, name in LABEL_NAMES.items())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lazy Qwen loader  — called only when actually needed
+# Lazy Qwen loader — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 QWEN_MODEL     = None
 QWEN_PROCESSOR = None
 
 
 def load_qwen():
-    """
-    Load Qwen into VRAM if not already loaded.
-    Safe to call multiple times — subsequent calls are no-ops.
-    Never called while TotalSegmentator could be running.
-    """
     global QWEN_MODEL, QWEN_PROCESSOR
     if QWEN_MODEL is not None:
-        return  # already loaded — nothing to do
-
+        return
     print("⏳  Loading Qwen into VRAM …")
     try:
         QWEN_MODEL = Qwen3_5ForConditionalGeneration.from_pretrained(
@@ -143,7 +148,7 @@ def load_qwen():
             device_map=DEVICE,
         ).eval()
         QWEN_PROCESSOR = AutoProcessor.from_pretrained(QWEN_MODEL_NAME)
-        print("✅  Qwen loaded — shared by all agent roles.")
+        print("✅  Qwen loaded.")
     except Exception as e:
         print(f"❌  Qwen failed to load: {e}")
         QWEN_MODEL     = None
@@ -156,30 +161,24 @@ def qwen_is_ready() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Startup: load Qwen only if preprocessing already done
+# Startup: load Qwen only if preprocessing already done — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 def _any_preprocessed_on_disk() -> bool:
-    """True if at least one complete preprocessed volume exists on disk."""
     try:
-        return any(
-            f.endswith("_df.parquet")
-            for f in os.listdir(PREPROCESS_DIR)
-        )
+        return any(f.endswith("_df.parquet") for f in os.listdir(PREPROCESS_DIR))
     except Exception:
         return False
 
 
 if _any_preprocessed_on_disk():
-    print("📂  Preprocessed volume(s) found on disk → loading Qwen at startup.")
+    print("📂  Preprocessed volume(s) found → loading Qwen at startup.")
     load_qwen()
 else:
-    print("⚠️   No preprocessed volumes found.")
-    print("     Qwen will load AFTER TotalSegmentator finishes preprocessing.")
-    print("     Upload a CT and click 'Preprocess CT' first.")
+    print("⚠️   No preprocessed volumes. Qwen loads after TotalSegmentator.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TotalSegmentator — lazy import
+# TotalSegmentator — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     from totalsegmentator.python_api import totalsegmentator as _totalsegmentator
@@ -192,7 +191,7 @@ except Exception as e:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Disk-based preprocessing helpers
+# Disk-based preprocessing helpers — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 def file_md5(path: str) -> str:
     h = hashlib.md5()
@@ -216,14 +215,6 @@ def is_preprocessed(md5: str) -> bool:
 
 
 def preprocess_ct(ct_path: str) -> dict:
-    """
-    STAGE 1 — Run TotalSegmentator (Qwen must NOT be in VRAM).
-
-    Guarantee: this function is only ever called when Qwen is not loaded
-    (fresh start) or after Qwen has been explicitly kept off GPU.
-    After saving outputs to disk, it calls load_qwen() so the agentic
-    pipeline is immediately ready.
-    """
     if not TS_AVAILABLE:
         raise gr.Error("TotalSegmentator is not installed in this environment.")
 
@@ -232,12 +223,9 @@ def preprocess_ct(ct_path: str) -> dict:
 
     if is_preprocessed(md5):
         print(f"📂  Already preprocessed ({md5[:8]}…) — skipping TS.")
-        # make sure Qwen is ready even if this is a repeat call
         load_qwen()
         return paths
 
-    # Safety: if Qwen somehow ended up loaded, evict it before TS starts.
-    # Under normal flow this branch is never hit.
     global QWEN_MODEL, QWEN_PROCESSOR
     if QWEN_MODEL is not None:
         print("⚠️   Qwen was in VRAM before TS — evicting now.")
@@ -247,53 +235,45 @@ def preprocess_ct(ct_path: str) -> dict:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    print(f"🩻  Running TotalSegmentator ({md5[:8]}…) with full VRAM …")
+    print(f"🩻  Running TotalSegmentator ({md5[:8]}…) …")
 
     try:
         input_img = nib.load(ct_path)
         zooms     = tuple(float(z) for z in input_img.header.get_zooms()[:3])
 
-        # fast=True → 3 mm model, ~6 GB peak VRAM, ~45 s for a 511×404×339 volume
         seg_img = _totalsegmentator(
             input=input_img,
-            ml=True,    # single multilabel volume (values 1..117)
-            fast=True,  # 3 mm — sufficient for anatomy education
+            ml=True,
+            fast=True,
             quiet=True,
         )
 
-        # save segmentation volume
         nib.save(seg_img, paths["seg"])
 
-        # build + save structure dataframe
         seg_arr = np.asarray(seg_img.dataobj).astype(np.uint8)
         df      = build_structure_dataframe(seg_arr, zooms)
         df.to_parquet(paths["df"], index=False)
 
-        # save metadata
         with open(paths["meta"], "w") as f:
             json.dump({"md5": md5, "zooms": list(zooms), "shape": list(seg_arr.shape)}, f)
 
-        print(f"✅  TS done — outputs saved to {PREPROCESS_DIR}/")
+        print(f"✅  TS done — outputs saved.")
 
     except Exception:
-        # clean up partial files so is_preprocessed() stays consistent
         for p in paths.values():
             if os.path.exists(p):
                 os.remove(p)
         raise
 
     finally:
-        # TS is done and out of memory — now safe to load Qwen
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # load Qwen now that VRAM is free
     load_qwen()
     return paths
 
 
 def load_df_and_meta(md5: str) -> tuple[pd.DataFrame, dict]:
-    """Read parquet + JSON from disk. TS not involved. Sub-100 ms."""
     paths = get_preprocess_paths(md5)
     df    = pd.read_parquet(paths["df"])
     with open(paths["meta"]) as f:
@@ -302,7 +282,6 @@ def load_df_and_meta(md5: str) -> tuple[pd.DataFrame, dict]:
 
 
 def load_arrays_for_preview(ct_path: str, md5: str):
-    """Load CT (int16) + saved segmentation (uint8) for overlay rendering."""
     paths   = get_preprocess_paths(md5)
     ct_img  = nib.load(ct_path)
     seg_img = nib.load(paths["seg"])
@@ -313,7 +292,7 @@ def load_arrays_for_preview(ct_path: str, md5: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Structure dataframe builder
+# Structure dataframe builder — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 def build_structure_dataframe(seg_arr: np.ndarray, zooms) -> pd.DataFrame:
     voxel_vol_mm3 = float(np.prod(zooms[:3])) if len(zooms) >= 3 else 1.0
@@ -374,7 +353,7 @@ def summarize_df_for_qwen(df: pd.DataFrame, requested_ids: list) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Overlay preview
+# Overlay preview — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 def _tab20(n):
     try:
@@ -420,7 +399,7 @@ def render_overlay_preview(ct_arr, seg_arr, target_ids) -> Image.Image:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utilities
+# Utilities — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 def safe_parse_json(text: str) -> dict:
     text = (text or "").strip()
@@ -466,7 +445,7 @@ def coerce_label_ids(raw_ids, raw_names=None) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Qwen helpers  (all guard on qwen_is_ready())
+# Qwen helpers — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_text_inputs(prompt_text: str):
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt_text}]}]
@@ -502,7 +481,7 @@ def qwen_json(instruction: str, max_tokens: int = 700, temperature: float = 0.15
     return parsed if isinstance(parsed, dict) else {}
 
 
-def qwen_stream(instruction: str, max_tokens: int = 950, temperature: float = 0.4):
+def qwen_stream(instruction: str, max_tokens: int = 1200, temperature: float = 0.4):
     if not qwen_is_ready():
         raise gr.Error("Qwen is not loaded. Please preprocess a CT volume first.")
     inputs   = _build_text_inputs(instruction)
@@ -533,152 +512,156 @@ def qwen_stream(instruction: str, max_tokens: int = 950, temperature: float = 0.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent steps  (Qwen reads df only — TS completely absent)
+# NEW: Hierarchical reasoning — replaces planner + reflection + final_answer
 # ─────────────────────────────────────────────────────────────────────────────
-def planner_step(user_query: str, feedback: str | None, already_selected: list, iteration: int) -> dict:
-    feedback_text = feedback or "No previous self-reflection feedback."
-    selected_text = (
-        ", ".join(f"{i}-{LABEL_NAMES[i]}" for i in already_selected)
-        if already_selected else "none yet"
-    )
-    instruction = f"""
-You are the PLANNER & TASK-ASSIGNER in an educational CT anatomy assistant.
 
-Available structures (TotalSegmentator labels — use ONLY these ids):
+# ── Step 1: build the anatomy tree + select structures (JSON, fast) ───────────
+def tree_structure_step(user_query: str, df: pd.DataFrame) -> dict:
+    """
+    Ask Qwen to build an anatomical hierarchy for the query and select
+    which segmentation labels to surface. Returns structured JSON.
+
+    Tree nodes:
+      ROOT  → the clinical/educational question
+      L1    → organ systems involved
+      L2    → specific organs / structures
+      L3    → sub-structures / relationships
+      LEAVES → segmentation label ids to highlight
+    """
+    present_structures = df[df["present"]]["structure"].tolist()
+
+    instruction = f"""
+You are an anatomy reasoning engine. Your job is to build a structured
+anatomical reasoning TREE for an educational CT question, then select
+the segmentation labels that answer it.
+
+━━━ USER QUESTION ━━━
+"{user_query}"
+
+━━━ STRUCTURES PRESENT IN THIS CT SCAN ━━━
+{", ".join(present_structures)}
+
+━━━ ALL AVAILABLE LABELS (id: name) ━━━
 {LABEL_MENU}
 
-User question:
-"{user_query}"
+━━━ YOUR TASK ━━━
+Build a reasoning tree with EXACTLY these four levels:
 
-Already selected so far: {selected_text}
-Self-reflection feedback from previous iteration:
-"{feedback_text}"
-Iteration: {iteration}
+  DECOMPOSE  → Which organ systems / body regions are relevant?
+  ANATOMY    → Which specific organs and their sub-structures matter?
+               Include parent-child relationships (e.g. kidney → cortex, medulla, pelvis).
+  GROUND     → Which structures from the scan are directly relevant?
+               Note expected vs present in this scan.
+  REFLECT    → Is the selection complete? Any critical neighbours missing?
 
-Your task:
-Use clinical/anatomical reasoning to decide which structures are needed
-to teach the user about their question, and what they should focus on.
+Then output the final label ids to highlight.
 
-Return ONLY valid JSON in this exact format:
+Return ONLY valid JSON (no markdown fences):
 {{
-  "target_label_ids": [5, 2, 3],
-  "target_names": ["liver", "kidney_right", "kidney_left"],
-  "clinical_reasoning": "why these structures answer the question",
-  "educational_focus": "what the learner should look for / focus on",
-  "plan_goal": "goal for this iteration"
+  "tree": {{
+    "decompose": {{
+      "question_root": "<restate question as a clinical goal>",
+      "organ_systems": ["<system1>", "<system2>"]
+    }},
+    "anatomy": {{
+      "<organ>": {{
+        "sub_structures": ["<part1>", "<part2>"],
+        "clinical_relevance": "<why it matters for this question>"
+      }}
+    }},
+    "ground": {{
+      "expected_labels": ["<name>"],
+      "found_in_scan":   ["<name>"],
+      "missing_from_scan": ["<name>"]
+    }},
+    "reflect": {{
+      "complete": true,
+      "gaps": "<any missing neighbours or context structures>",
+      "added": ["<extra label names if needed>"]
+    }}
+  }},
+  "selected_label_ids":   [2, 3, 23, 24],
+  "selected_label_names": ["kidney_right", "kidney_left", "kidney_cyst_left", "kidney_cyst_right"],
+  "educational_focus":    "<one sentence: what the student should look for>"
 }}
 
 Rules:
-- Pick the SMALLEST set of structures that fully covers the question.
-- If previous feedback asked for more structures, ADD them (keep old ones).
-- Use only ids/names from the list above.
-- Educational only — do NOT diagnose, do NOT invent findings.
-- Return JSON only, no markdown.
+- selected_label_ids must only contain ids present in the scan.
+- Pick the SMALLEST complete set — quality over quantity.
+- Do not diagnose. Educational only.
+- Return JSON only.
 """
-    result   = qwen_json(instruction, max_tokens=650, temperature=0.1)
-    ids      = coerce_label_ids(result.get("target_label_ids"), result.get("target_names"))
-    ids      = list(dict.fromkeys(list(already_selected) + ids))
-    fallback = not ids
+    result = qwen_json(instruction, max_tokens=900, temperature=0.1)
+
+    # coerce ids
+    ids = coerce_label_ids(
+        result.get("selected_label_ids"),
+        result.get("selected_label_names"),
+    )
+    # fallback: all present structures
+    if not ids:
+        ids = df[df["present"]]["id"].astype(int).tolist()
+
+    # filter to only structures actually present
+    present_ids = set(df[df["present"]]["id"].astype(int).tolist())
+    ids = [i for i in ids if i in present_ids]
 
     return {
-        "target_label_ids":   ids,
-        "target_names":       [LABEL_NAMES[i] for i in ids],
-        "clinical_reasoning": str(result.get("clinical_reasoning", "") or "").strip(),
-        "educational_focus":  str(result.get("educational_focus",  "") or "").strip(),
-        "plan_goal":          str(result.get("plan_goal", f"Iteration {iteration} plan") or "").strip(),
-        "fallback_used":      fallback,
+        "tree":                  result.get("tree", {}),
+        "selected_label_ids":    ids,
+        "selected_label_names":  [LABEL_NAMES[i] for i in ids],
+        "educational_focus":     str(result.get("educational_focus", "") or "").strip(),
+        "fallback_used":         not ids,
     }
 
 
-def reflection_step(user_query: str, plan: dict, df_summary: dict, iteration: int, max_iter: int) -> dict:
-    instruction = f"""
-You are the SELF-REFLECTION agent in an educational CT anatomy assistant.
-
-User question:
-"{user_query}"
-
-Planner's educational focus:
-"{plan.get('educational_focus', '')}"
-
-Segmentation results for requested structures:
-{json.dumps(df_summary, indent=2)}
-
-Iteration {iteration} of at most {max_iter}.
-
-Decide whether the structures are COMPLETE and CLINICALLY SUFFICIENT to give
-a good educational answer.
-
-Return ONLY valid JSON in this exact format:
-{{
-  "sufficient": true,
-  "confidence": 0.85,
-  "critique": "what is good or missing",
-  "missing_label_ids": [],
-  "feedback_to_planner": "if not sufficient, exactly which structures to add and why"
-}}
-
-Decide NOT sufficient if:
-- A requested structure relevant to the question was NOT found in the scan, OR
-- An obviously related neighbouring structure should also be included.
-
-Rules:
-- missing_label_ids must come only from structures present in the scan.
-- Be reasonable — do not demand the whole body for a focused question.
-- confidence between 0 and 1. Return JSON only.
-"""
-    result         = qwen_json(instruction, max_tokens=600, temperature=0.1)
-    sufficient_raw = result.get("sufficient", True)
-    if isinstance(sufficient_raw, str):
-        sufficient = sufficient_raw.strip().lower() in {"true", "yes", "sufficient", "pass"}
-    else:
-        sufficient = bool(sufficient_raw)
-
-    return {
-        "sufficient":          sufficient,
-        "confidence":          safe_float(result.get("confidence", 0.0)),
-        "critique":            str(result.get("critique",            "") or "").strip(),
-        "missing_label_ids":   coerce_label_ids(result.get("missing_label_ids")),
-        "feedback_to_planner": str(result.get("feedback_to_planner", "") or "").strip(),
-    }
-
-
-def final_answer_instruction(user_query: str, plan: dict, df_summary: dict) -> str:
+# ── Step 2: stream the educational answer guided by the tree ──────────────────
+def tree_answer_prompt(user_query: str, tree_result: dict, df_summary: dict) -> str:
+    tree_str = json.dumps(tree_result.get("tree", {}), indent=2)
+    focus    = tree_result.get("educational_focus", "")
     return f"""
-You are an anatomy & radiology TEACHER. Write a clear educational answer for a
-student/clinician based ONLY on the CT segmentation facts below.
+You are an anatomy and radiology TEACHER. A student asked:
 
-User question:
 "{user_query}"
 
-Educational focus:
-"{plan.get('educational_focus', '')}"
+You already built this anatomical reasoning tree:
+{tree_str}
 
-Segmentation facts (volumes in ml, slice ranges are axial indices):
+Educational focus: "{focus}"
+
+Segmentation measurements from the CT (volumes in ml, axial slice indices):
 {json.dumps(df_summary, indent=2)}
 
-Write a well-structured answer with these headings:
+Write a clear, structured educational answer using the tree as your guide.
+Use these exact headings and follow the tree hierarchy in each section:
 
-1. **What was segmented** — structures found, their size, axial position.
-2. **What to look for** — shape, symmetry, size, edges, neighbour relationships.
-3. **Anatomy & teaching context** — why these structures matter for the question.
-4. **Limitations** — automatic model caveats; this is educational, NOT a diagnosis.
+## 🌳 Anatomical Hierarchy
+Show the reasoning tree you built: organ system → organ → sub-structures.
+Use indented bullet points to reflect parent-child relationships.
+
+## 🔬 What the Segmentation Shows
+For each selected structure: volume, axial position, symmetry (if bilateral).
+Ground your observations in the tree's GROUND node.
+
+## 📖 Anatomy & Clinical Context
+Explain the sub-structures and their relationships.
+Why do they matter for the student's question?
+
+## ⚠️ Limitations
+Automatic model caveats. Educational only — not a diagnosis.
 
 Rules:
-- Use ONLY the provided facts. Do not invent measurements or pathology.
-- Do not give a diagnosis.
+- Use ONLY the provided segmentation facts. Do not invent measurements.
+- Do not diagnose. Teach.
+- Keep the tree hierarchy visible in your writing.
 """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1 Gradio handler — "Preprocess CT" button
+# Gradio handler — Stage 1 (Preprocess) — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 @spaces.GPU(duration=300)
 def run_preprocessing(ct_file):
-    """
-    Runs TotalSegmentator on the uploaded CT.
-    Qwen is NOT in VRAM at this point (either never loaded, or evicted).
-    After TS finishes, load_qwen() is called inside preprocess_ct().
-    """
     if not TS_AVAILABLE:
         return "❌ TotalSegmentator is not available in this environment."
     if ct_file is None:
@@ -690,7 +673,6 @@ def run_preprocessing(ct_file):
     if is_preprocessed(md5):
         df, meta  = load_df_and_meta(md5)
         n_present = int(df["present"].sum())
-        # Still call load_qwen in case this is the first session with cached data
         load_qwen()
         return (
             f"📂 Already preprocessed ({md5[:8]}…)\n"
@@ -699,7 +681,7 @@ def run_preprocessing(ct_file):
         )
 
     try:
-        preprocess_ct(ct_path)   # TS runs here; load_qwen() called inside
+        preprocess_ct(ct_path)
         df, meta  = load_df_and_meta(md5)
         n_present = int(df["present"].sum())
         return (
@@ -712,134 +694,134 @@ def run_preprocessing(ct_file):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 2 Gradio handler — "Run Agentic Analysis" button
+# Gradio handler — Stage 2 (Analyse) — NEW hierarchical flow
 # ─────────────────────────────────────────────────────────────────────────────
 EMPTY_DF = pd.DataFrame(columns=["id", "structure", "present", "voxels",
                                   "volume_ml", "z_min", "z_max", "z_mid"])
 
 
+def _render_tree_md(tree: dict) -> str:
+    """Convert the tree JSON into a readable markdown string for the UI panel."""
+    if not tree:
+        return "_Tree not yet built._"
+    lines = []
+
+    d = tree.get("decompose", {})
+    if d:
+        lines.append(f"**🎯 Question Root**\n{d.get('question_root', '')}")
+        systems = d.get("organ_systems", [])
+        if systems:
+            lines.append("**Organ Systems:** " + " · ".join(systems))
+
+    a = tree.get("anatomy", {})
+    if a:
+        lines.append("\n**🫀 Anatomy**")
+        for organ, info in a.items():
+            lines.append(f"- **{organ}**")
+            for s in info.get("sub_structures", []):
+                lines.append(f"  - {s}")
+            rel = info.get("clinical_relevance", "")
+            if rel:
+                lines.append(f"  > {rel}")
+
+    g = tree.get("ground", {})
+    if g:
+        lines.append("\n**🔬 Grounding**")
+        found   = g.get("found_in_scan",    [])
+        missing = g.get("missing_from_scan", [])
+        if found:
+            lines.append("✅ Found: " + ", ".join(found))
+        if missing:
+            lines.append("❌ Missing: " + ", ".join(missing))
+
+    r = tree.get("reflect", {})
+    if r:
+        complete = r.get("complete", True)
+        lines.append("\n**🔁 Reflection**")
+        lines.append("Complete: " + ("✅ Yes" if complete else "⚠️ No"))
+        gaps = r.get("gaps", "")
+        if gaps:
+            lines.append(f"Gaps: {gaps}")
+        added = r.get("added", [])
+        if added:
+            lines.append("Added: " + ", ".join(added))
+
+    return "\n".join(lines)
+
+
 @spaces.GPU(duration=600)
-def run_agentic_ct(ct_file, user_query, max_iterations):
+def run_agentic_ct(ct_file, user_query):
     if ct_file is None:
         raise gr.Error("Please upload a CT volume.")
     if not user_query or not user_query.strip():
         raise gr.Error("Please enter a clinical / educational question.")
 
-    ct_path        = ct_file if isinstance(ct_file, str) else ct_file.name
-    md5            = file_md5(ct_path)
-    max_iterations = int(max(1, min(3, int(max_iterations))))
+    ct_path = ct_file if isinstance(ct_file, str) else ct_file.name
+    md5     = file_md5(ct_path)
 
-    status       = ""
-    answer       = ""
-    plan_text    = ""
-    reflect_text = ""
-    trace_text   = ""
-    preview      = None
-    df_display   = EMPTY_DF
+    status     = ""
+    answer     = ""
+    tree_md    = ""
+    preview    = None
+    df_display = EMPTY_DF
 
     def snapshot():
-        return (status, answer, df_display, preview, plan_text, reflect_text, trace_text)
+        return (status, answer, df_display, preview, tree_md)
 
-    # ── Guard: must be preprocessed before Qwen can work ─────────────────────
+    # ── Guard: must be preprocessed ───────────────────────────────────────────
     if not is_preprocessed(md5):
         if not TS_AVAILABLE:
             raise gr.Error(
-                "This CT has not been preprocessed and TotalSegmentator is unavailable. "
-                "Please click 'Preprocess CT' first."
+                "CT not preprocessed and TotalSegmentator unavailable. "
+                "Click 'Preprocess CT' first."
             )
-        status = "🩻 Not preprocessed yet — running TotalSegmentator (one-time, ~45 s) …"
+        status = "🩻 Not preprocessed — running TotalSegmentator (~45 s) …"
         yield snapshot()
-        preprocess_ct(ct_path)  # TS runs; load_qwen() called at the end
+        preprocess_ct(ct_path)
     else:
         status = "📂 Segmentation found on disk — loading …"
         yield snapshot()
-        load_qwen()  # no-op if already loaded
+        load_qwen()
 
     if not qwen_is_ready():
         raise gr.Error("Qwen failed to load. Check logs.")
 
-    # ── Load df + arrays ──────────────────────────────────────────────────────
-    df, meta       = load_df_and_meta(md5)
-    df_display     = df[df["present"]].reset_index(drop=True)
+    # ── Load data ─────────────────────────────────────────────────────────────
+    df, meta              = load_df_and_meta(md5)
     ct_arr, seg_arr, zooms = load_arrays_for_preview(ct_path, md5)
 
-    status = f"✅ {int(df['present'].sum())} structures available. Qwen planning …"
+    status = f"✅ {int(df['present'].sum())} structures available. Building anatomy tree …"
     yield snapshot()
 
-    logs             = []
-    selected_ids     = []
-    feedback         = None
-    final_plan       = None
-    final_reflection = None
+    # ── Step 1: tree reasoning (JSON) ─────────────────────────────────────────
+    status = "🌳 Building anatomical hierarchy …"
+    yield snapshot()
 
-    # ── Agentic loop ──────────────────────────────────────────────────────────
-    for iteration in range(1, max_iterations + 1):
-        status = f"🧠 Planner — iteration {iteration}/{max_iterations} …"
-        yield snapshot()
+    tree_result = tree_structure_step(user_query, df)
+    selected_ids = tree_result["selected_label_ids"]
+    tree_md      = _render_tree_md(tree_result.get("tree", {}))
 
-        plan = planner_step(user_query, feedback, selected_ids, iteration)
-        if plan["fallback_used"]:
-            plan["target_label_ids"] = df[df["present"]]["id"].astype(int).tolist()
-            plan["target_names"]     = [LABEL_NAMES[i] for i in plan["target_label_ids"]]
+    status = f"🔬 Surfacing {len(selected_ids)} structure(s) from segmentation …"
+    yield snapshot()
 
-        selected_ids = plan["target_label_ids"]
-        final_plan   = plan
-        plan_text    = json.dumps(plan, indent=2)
+    df_display = df[df["id"].isin(selected_ids)].reset_index(drop=True)
+    preview    = render_overlay_preview(ct_arr, seg_arr, selected_ids)
+    yield snapshot()
 
-        status = f"🔬 Surfacing {len(selected_ids)} structure(s) from saved segmentation …"
-        yield snapshot()
+    # ── Step 2: streamed educational answer guided by tree ────────────────────
+    status = "✍️  Writing tree-guided educational answer …"
+    yield snapshot()
 
-        df_display = df[df["id"].isin(selected_ids)].reset_index(drop=True)
-        preview    = render_overlay_preview(ct_arr, seg_arr, selected_ids)
-        yield snapshot()
-
-        status = f"🔍 Self-reflection — iteration {iteration} sufficient?"
-        yield snapshot()
-
-        df_summary       = summarize_df_for_qwen(df, selected_ids)
-        reflection       = reflection_step(user_query, plan, df_summary, iteration, max_iterations)
-        final_reflection = reflection
-        reflect_text     = json.dumps(reflection, indent=2)
-
-        logs.append({
-            "iteration":            iteration,
-            "planner":              plan,
-            "segmentation_summary": df_summary,
-            "self_reflection":      reflection,
-        })
-        trace_text = json.dumps(logs, indent=2)
-        yield snapshot()
-
-        if reflection["sufficient"]:
-            status = f"✅ Sufficient after {iteration} iteration(s). Writing answer …"
-            yield snapshot()
-            break
-
-        miss       = reflection.get("missing_label_ids", [])
-        miss_names = ", ".join(LABEL_NAMES[i] for i in miss) if miss else "(none specified)"
-        feedback   = (
-            f"{reflection.get('feedback_to_planner', '')} "
-            f"Add these structures: {miss_names}."
-        )
-        selected_ids = list(dict.fromkeys(selected_ids + miss))
-        status = f"↩️ Not sufficient — re-planning (iteration {iteration + 1}) …"
-        yield snapshot()
-    else:
-        status = "⛔ Max iterations reached. Writing best available answer …"
-        yield snapshot()
-
-    # ── Final streamed answer ─────────────────────────────────────────────────
     df_summary  = summarize_df_for_qwen(df, selected_ids)
-    instruction = final_answer_instruction(user_query, final_plan, df_summary)
-    for partial in qwen_stream(instruction, max_tokens=950, temperature=0.4):
+    instruction = tree_answer_prompt(user_query, tree_result, df_summary)
+
+    for partial in qwen_stream(instruction, max_tokens=1200, temperature=0.4):
         answer = partial
         yield snapshot()
 
-    conf   = final_reflection.get("confidence", 0.0) if final_reflection else 0.0
     status = (
-        f"Done — iterations: {len(logs)} | structures: {len(selected_ids)} | "
-        f"sufficiency: {final_reflection.get('sufficient') if final_reflection else 'n/a'} "
-        f"(conf {conf:.2f})"
+        f"Done — structures highlighted: {len(selected_ids)} | "
+        f"focus: {tree_result.get('educational_focus', '')[:60]}…"
     )
     yield snapshot()
 
@@ -924,7 +906,12 @@ footer { display: none !important; }
     font-size:0.9rem; color:#2E5378;
 }
 .dark .disclaimer { color:#A8CCE1; }
-.gradio-textbox textarea { font-family:'IBM Plex Mono',monospace !important; font-size:0.9rem !important; }
+.tree-panel {
+    background:rgba(30,52,80,0.04); border:1px solid rgba(70,130,180,0.2);
+    border-radius:10px; padding:14px 16px; font-size:0.88rem;
+    font-family:'IBM Plex Mono',monospace;
+}
+.dark .tree-panel { background:rgba(70,130,180,0.08); }
 label { font-weight:600 !important; }
 """
 
@@ -932,18 +919,18 @@ label { font-weight:600 !important; }
 def html_header():
     return """
     <div class="app-header">
-        <h1>🩻 Agentic CT Tutor</h1>
+        <h1>🩻 CT Anatomy Tutor — Tree Reasoning</h1>
         <p>
-            Stage 1: TotalSegmentator preprocesses the CT once (Qwen not loaded).
-            Stage 2: Qwen loads after TS exits — reads saved data, reasons, teaches.
-            The two models never share VRAM.
+            Stage 1: TotalSegmentator segments the CT (Qwen not in VRAM).
+            Stage 2: Qwen builds an anatomical reasoning tree, grounds it in
+            segmentation data, then teaches.
         </p>
         <div class="flow">
             <span>Upload CT</span>
             <span>→ Preprocess (TS only)</span>
             <span>→ Qwen loads</span>
-            <span>→ Plan → Reflect (≤3×)</span>
-            <span>→ Answer</span>
+            <span>→ Decompose → Anatomy → Ground → Reflect</span>
+            <span>→ Tree-guided Answer</span>
         </div>
     </div>
     """
@@ -954,18 +941,19 @@ EXAMPLES = [
     ["I want to learn about the liver and nearby organs on this scan."],
     ["Explain the thoracic vertebrae and ribs visible here."],
     ["What should I focus on when assessing the lungs?"],
+    ["Walk me through the abdominal aorta and its branches."],
 ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI
+# UI — simplified: no iteration slider, tree panel replaces trace boxes
 # ─────────────────────────────────────────────────────────────────────────────
-with gr.Blocks(theme=steel_blue_theme, css=css, title="Agentic CT Tutor") as demo:
+with gr.Blocks(theme=steel_blue_theme, css=css, title="CT Anatomy Tutor") as demo:
     gr.HTML(html_header())
     gr.HTML(
         '<div class="disclaimer"><strong>Educational tool.</strong> Outputs come from an '
-        'automatic segmentation model and an LLM. This is for learning about anatomy on a CT '
-        '— it is <strong>not a diagnosis</strong>. A qualified clinician must interpret real scans.</div>'
+        'automatic segmentation model and an LLM. This is for learning anatomy on a CT — '
+        'it is <strong>not a diagnosis</strong>. A qualified clinician must interpret real scans.</div>'
     )
 
     with gr.Row():
@@ -974,44 +962,52 @@ with gr.Blocks(theme=steel_blue_theme, css=css, title="Agentic CT Tutor") as dem
         with gr.Column(scale=1):
             gr.HTML(
                 '<div class="stage-box stage-1"><strong>Stage 1 — Preprocess CT</strong><br>'
-                'Qwen is not loaded yet. TotalSegmentator gets the full GPU. '
-                'Results saved to disk permanently. Qwen loads after TS finishes.</div>'
+                'TotalSegmentator gets full GPU. Results cached to disk permanently. '
+                'Qwen loads only after TS exits.</div>'
             )
             ct_input          = gr.File(label="CT volume (.nii / .nii.gz)",
                                         file_types=[".nii", ".gz"], type="filepath")
-            preprocess_btn    = gr.Button("Preprocess CT  (run TotalSegmentator)", variant="secondary")
+            preprocess_btn    = gr.Button("Preprocess CT  (TotalSegmentator)", variant="secondary")
             preprocess_status = gr.Textbox(label="Preprocessing status", interactive=False, lines=3)
 
             gr.HTML(
                 '<div class="stage-box stage-2" style="margin-top:16px">'
-                '<strong>Stage 2 — Ask Qwen</strong><br>'
-                'Qwen reads the saved segmentation dataframe. TotalSegmentator is never touched again.</div>'
+                '<strong>Stage 2 — Ask</strong><br>'
+                'Qwen builds an anatomy tree, grounds it in segmentation facts, '
+                'then explains.</div>'
             )
             query_input = gr.Textbox(
                 label="Clinical / educational question",
-                placeholder="e.g. Show me the kidneys and what to look for regarding cysts",
+                placeholder="e.g. What should I check when looking for kidney cysts?",
                 lines=3,
             )
-            with gr.Accordion("Settings", open=False):
-                max_iter_slider = gr.Slider(minimum=1, maximum=3, value=3, step=1,
-                                            label="Max planner / self-reflection iterations")
-            run_btn    = gr.Button("Run Agentic Analysis  (Qwen only)", variant="primary")
+            run_btn    = gr.Button("Analyse  (tree reasoning)", variant="primary")
             gr.Examples(examples=EXAMPLES, inputs=[query_input], label="Example questions")
             status_box = gr.Textbox(label="Pipeline status", interactive=False, lines=2)
 
-        # ── Middle: preview + df ──────────────────────────────────────────────
+        # ── Middle: tree + preview + df ───────────────────────────────────────
         with gr.Column(scale=1):
-            preview_img = gr.Image(label="Segmentation overlay (requested structures)", height=320)
-            df_view     = gr.Dataframe(label="Structure dataframe (what Qwen reasons over)",
-                                       interactive=False, wrap=True)
+            gr.Markdown("### 🌳 Anatomy Reasoning Tree")
+            tree_box    = gr.Markdown(
+                value="_Tree will appear here after analysis._",
+                elem_classes=["tree-panel"],
+            )
+            preview_img = gr.Image(
+                label="Segmentation overlay (structures selected by tree)",
+                height=280,
+            )
+            df_view = gr.Dataframe(
+                label="Structures the tree selected",
+                interactive=False,
+                wrap=True,
+            )
 
-        # ── Right: answer + trace ─────────────────────────────────────────────
+        # ── Right: educational answer ─────────────────────────────────────────
         with gr.Column(scale=1):
-            answer_box = gr.Markdown(label="Educational answer")
-            with gr.Accordion("Agent trace", open=False):
-                plan_box    = gr.Textbox(label="Planner output",        lines=10, interactive=False)
-                reflect_box = gr.Textbox(label="Self-reflection output", lines=8,  interactive=False)
-                trace_box   = gr.Textbox(label="Full iteration trace",  lines=16, interactive=False)
+            gr.Markdown("### 📖 Educational Answer")
+            answer_box = gr.Markdown(
+                value="_Answer streams here once the tree is built._",
+            )
 
     preprocess_btn.click(
         fn=run_preprocessing,
@@ -1020,12 +1016,10 @@ with gr.Blocks(theme=steel_blue_theme, css=css, title="Agentic CT Tutor") as dem
     )
     run_btn.click(
         fn=run_agentic_ct,
-        inputs=[ct_input, query_input, max_iter_slider],
-        outputs=[status_box, answer_box, df_view, preview_img,
-                 plan_box, reflect_box, trace_box],
+        inputs=[ct_input, query_input],
+        outputs=[status_box, answer_box, df_view, preview_img, tree_box],
     )
 
 
 if __name__ == "__main__":
     demo.launch(show_error=True, ssr_mode=False, share=True)
-
